@@ -1,0 +1,100 @@
+# ============================================================
+# macOS
+# ============================================================
+.DS_Store
+.DS_Store?
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+Thumbs.db
+
+# ============================================================
+# Xcode
+# ============================================================
+# Generated project (rebuild with: xcodegen generate)
+*.xcodeproj/
+*.xcworkspace/
+
+# Keep these if you commit the xcodeproj — remove the above
+# and uncomment below instead:
+# *.xcodeproj/xcuserdata/
+# *.xcodeproj/project.xcworkspace/xcuserdata/
+# *.xcworkspace/xcuserdata/
+
+# Build output
+DerivedData/
+build/
+*.ipa
+*.app.dSYM.zip
+*.dSYM
+
+# Archives and distribution
+*.xcarchive
+ExportOptions.plist
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# ============================================================
+# Swift Package Manager
+# ============================================================
+.build/
+.swiftpm/
+
+# ============================================================
+# CocoaPods (not used, but prevent accidental commits)
+# ============================================================
+Pods/
+Podfile.lock
+
+# ============================================================
+# Node / Backend
+# ============================================================
+backend/node_modules/
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/.items.json
+backend/*.log
+backend/npm-debug.log*
+backend/yarn-error.log
+
+# ============================================================
+# Security-sensitive files (never commit these)
+# ============================================================
+*.env
+*.env.local
+*.env.production
+# Private keys, certs, provisioning profiles
+*.pem
+*.key
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+AuthKey_*.p8
+
+# ============================================================
+# Test output
+# ============================================================
+*.xcresult
+
+# ============================================================
+# IDE / editor
+# ============================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ============================================================
+# Logs and temp
+# ============================================================
+*.log
+tmp/
+temp/
