@@ -130,13 +130,13 @@ See `docs/SECURITY.md` for the full technical document. Summary:
 | App Store listing | https://apps.apple.com/app/idXXXXXXXXX (populate post-release) |
 | Support contact | saaketh.manepalli@gmail.com |
 | Security disclosure | saaketh.manepalli@gmail.com |
-| Webhook endpoint | https://api.budgetgoat.app/api/plaid/webhooks |
+| Webhook endpoint | https://budget-goat-api.fly.dev/api/plaid/webhooks |
 
 ---
 
 ## 9. Webhook Configuration
 
-Backend exposes a signed webhook handler at https://api.budgetgoat.app/api/plaid/webhooks.
+Backend exposes a signed webhook handler at https://budget-goat-api.fly.dev/api/plaid/webhooks.
 
 Events consumed:
 - `SYNC_UPDATES_AVAILABLE` → enqueue background transaction sync + APNs silent push to the iOS client

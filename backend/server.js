@@ -1,21 +1,39 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import rateLimit from 'express-rate-limit';
 import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } from 'plaid';
+import { storeItem, getAccessToken, deleteItem, itemExists } from './db.js';
+import { requireAuth } from './auth.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-const PLAID_CLIENT_ID = process.env.PLAID_CLIENT_ID;
-const PLAID_SECRET    = process.env.PLAID_SECRET;
-const PLAID_ENV       = process.env.PLAID_ENV || 'sandbox';
-const PORT            = Number(process.env.PORT || 8787);
+const NODE_ENV           = process.env.NODE_ENV || 'development';
+const IS_PRODUCTION      = NODE_ENV === 'production';
+const PLAID_CLIENT_ID    = process.env.PLAID_CLIENT_ID;
+const PLAID_SECRET       = process.env.PLAID_SECRET;
+const PLAID_ENV          = process.env.PLAID_ENV || 'sandbox';
+const PLAID_REDIRECT_URI = process.env.PLAID_REDIRECT_URI || null;
+const PLAID_PRODUCTS     = (process.env.PLAID_PRODUCTS || 'transactions')
+                             .split(',').map(s => s.trim());
+const PORT               = Number(process.env.PORT || 8787);
 
 if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
-  console.error('Missing PLAID_CLIENT_ID or PLAID_SECRET in env. Set them in backend/.env');
+  console.error('Missing PLAID_CLIENT_ID or PLAID_SECRET');
   process.exit(1);
+}
+
+// Production startup contract: refuse to boot with insecure config.
+if (IS_PRODUCTION) {
+  const violations = [];
+  if (PLAID_ENV !== 'production')            violations.push('PLAID_ENV must be "production"');
+  if (process.env.DEV_SESSION_TOKEN)         violations.push('DEV_SESSION_TOKEN must not be set');
+  if (!PLAID_REDIRECT_URI)                   violations.push('PLAID_REDIRECT_URI must be set');
+  if (PLAID_REDIRECT_URI && !PLAID_REDIRECT_URI.startsWith('https://')) {
+    violations.push('PLAID_REDIRECT_URI must be an https:// Universal Link in production');
+  }
+  if (violations.length) {
+    console.error('Refusing to start in production:\n  - ' + violations.join('\n  - '));
+    process.exit(1);
+  }
 }
 
 const plaid = new PlaidApi(new Configuration({
@@ -26,38 +44,114 @@ const plaid = new PlaidApi(new Configuration({
   }}
 }));
 
-const STORE_PATH = path.join(__dirname, '.items.json');
-const readStore  = () => { try { return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')); } catch { return {}; } };
-const writeStore = (s) => fs.writeFileSync(STORE_PATH, JSON.stringify(s, null, 2));
-
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '512kb' }));
 
-app.use((req, _res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
+// Trust proxy headers on Fly.io
+app.set('trust proxy', 1);
+
+// Security headers
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
+  next();
+});
+
+app.use(cors({ origin: false }));
+app.use(express.json({ limit: '64kb' }));
+
+// Global rate limit
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests' },
+});
+app.use(globalLimiter);
+
+// Tight limit on Plaid-touching endpoints
+const plaidLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { error: 'Too many requests to bank endpoints' },
+});
+
+// Minimal, privacy-safe access log. Never logs bodies, query strings, or headers.
+app.use((req, res, next) => {
+  const started = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - started;
+    console.log(`${new Date().toISOString()} ${req.method} ${req.path} ${res.statusCode} ${ms}ms`);
+  });
   next();
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, env: PLAID_ENV }));
 
-app.post('/api/link/token/create', async (req, res) => {
+// Device auth — issues a 30-day JWT for a device UUID
+// No requireAuth — this IS the auth endpoint
+app.post('/auth/device', rateLimit({ windowMs: 60_000, max: 5 }), async (req, res) => {
   try {
-    const response = await plaid.linkTokenCreate({
-      user: { client_user_id: 'dev-user' },
-      client_name: 'Budget Goat',
-      products: [Products.Transactions],
-      country_codes: [CountryCode.Us],
-      language: 'en',
-    });
-    res.json({ link_token: response.data.link_token, expiration: response.data.expiration });
+    const { device_id } = req.body;
+    if (!device_id || typeof device_id !== 'string' || device_id.length < 10) {
+      return res.status(400).json({ error: 'device_id required' });
+    }
+
+    const { SignJWT } = await import('jose');
+    const secret = new TextEncoder().encode(process.env.JWT_SECRET);
+    const token = await new SignJWT({ sub: device_id, type: 'device' })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuedAt()
+      .setExpirationTime('30d')
+      .sign(secret);
+
+    res.json({ session_token: token, expires_in: 30 * 24 * 3600 });
   } catch (e) {
-    console.error('link/token/create failed:', e.response?.data || e.message);
-    res.status(500).json({ error: e.response?.data || e.message });
+    console.error('device auth error:', e.message);
+    res.status(500).json({ error: 'Unable to issue token' });
   }
 });
 
-app.post('/api/item/public_token/exchange', async (req, res) => {
+// All API routes require authentication
+app.use('/api', requireAuth);
+
+app.post('/api/link/token/create', plaidLimiter, async (req, res) => {
+  try {
+    const isSandbox = PLAID_ENV === 'sandbox';
+    const payload = {
+      user: {
+        client_user_id: req.userId,
+        // In sandbox, supplying a pre-verified phone bypasses Plaid's Layer
+        // phone-entry prompt entirely. Omitted in production so real users
+        // go through proper verification.
+        ...(isSandbox ? {
+          phone_number: '+14155550015',
+          phone_number_verified_time: new Date().toISOString(),
+        } : {}),
+      },
+      client_name: 'Budget Goat',
+      products: PLAID_PRODUCTS,
+      country_codes: [CountryCode.Us],
+      language: 'en',
+    };
+    if (PLAID_REDIRECT_URI) {
+      payload.redirect_uri = PLAID_REDIRECT_URI;
+    }
+    const response = await plaid.linkTokenCreate(payload);
+    res.json({ link_token: response.data.link_token, expiration: response.data.expiration });
+  } catch (e) {
+    const err = e.response?.data;
+    console.error('link/token/create error:', err?.error_code, err?.error_message);
+    // Surface the real Plaid error so the iOS app can show it to the user
+    res.status(502).json({
+      error: err?.error_message || 'Unable to create link token',
+      error_code: err?.error_code,
+    });
+  }
+});
+
+app.post('/api/item/public_token/exchange', plaidLimiter, async (req, res) => {
   try {
     const { public_token, institution_id } = req.body;
     if (!public_token) return res.status(400).json({ error: 'public_token required' });
@@ -67,20 +161,22 @@ app.post('/api/item/public_token/exchange', async (req, res) => {
     const item_id      = ex.data.item_id;
 
     const accts = await plaid.accountsGet({ access_token });
-    const institutionName = accts.data.item.institution_id
-      ? (await plaid.institutionsGetById({
-          institution_id: accts.data.item.institution_id,
-          country_codes:  [CountryCode.Us],
-        })).data.institution.name
-      : 'Unknown Institution';
+    const institutionId = institution_id || accts.data.item.institution_id || 'unknown';
 
-    const store = readStore();
-    store[item_id] = { access_token, institution_id, institutionName };
-    writeStore(store);
+    let institutionName = 'Unknown Institution';
+    try {
+      const inst = await plaid.institutionsGetById({
+        institution_id: institutionId,
+        country_codes: [CountryCode.Us],
+      });
+      institutionName = inst.data.institution.name;
+    } catch { /* non-fatal */ }
+
+    storeItem(item_id, access_token, institutionId, institutionName);
 
     res.json({
       item_id,
-      institution_id: institution_id || accts.data.item.institution_id,
+      institution_id: institutionId,
       institution_name: institutionName,
       accounts: accts.data.accounts.map(a => ({
         account_id: a.account_id,
@@ -92,22 +188,23 @@ app.post('/api/item/public_token/exchange', async (req, res) => {
       })),
     });
   } catch (e) {
-    console.error('exchange failed:', e.response?.data || e.message);
-    res.status(500).json({ error: e.response?.data || e.message });
+    console.error('exchange error:', e.response?.data?.error_code);
+    res.status(500).json({ error: 'Unable to exchange token' });
   }
 });
 
-app.post('/api/transactions/sync', async (req, res) => {
+app.post('/api/transactions/sync', plaidLimiter, async (req, res) => {
   try {
     const { item_id, cursor, count } = req.body;
-    const store = readStore();
-    const entry = store[item_id];
-    if (!entry) return res.status(404).json({ error: 'item not found' });
+    if (!item_id) return res.status(400).json({ error: 'item_id required' });
+
+    const access_token = getAccessToken(item_id);
+    if (!access_token) return res.status(404).json({ error: 'item not found' });
 
     const response = await plaid.transactionsSync({
-      access_token: entry.access_token,
+      access_token,
       cursor: cursor || undefined,
-      count:  count || 500,
+      count: Math.min(count || 500, 500),
     });
 
     const d = response.data;
@@ -119,29 +216,29 @@ app.post('/api/transactions/sync', async (req, res) => {
       has_more:    d.has_more,
     });
   } catch (e) {
-    console.error('sync failed:', e.response?.data || e.message);
     const code = e.response?.data?.error_code;
     if (code === 'ITEM_LOGIN_REQUIRED') {
       return res.status(409).json({ error: 'ITEM_LOGIN_REQUIRED', item_id: req.body.item_id });
     }
-    res.status(500).json({ error: e.response?.data || e.message });
+    console.error('sync error:', code);
+    res.status(500).json({ error: 'Unable to sync transactions' });
   }
 });
 
-app.post('/api/item/remove', async (req, res) => {
+app.post('/api/item/remove', plaidLimiter, async (req, res) => {
   try {
     const { item_id } = req.body;
-    const store = readStore();
-    const entry = store[item_id];
-    if (entry) {
-      await plaid.itemRemove({ access_token: entry.access_token });
-      delete store[item_id];
-      writeStore(store);
+    if (!item_id) return res.status(400).json({ error: 'item_id required' });
+
+    const access_token = getAccessToken(item_id);
+    if (access_token) {
+      try { await plaid.itemRemove({ access_token }); } catch { /* already removed */ }
+      deleteItem(item_id);
     }
     res.json({});
   } catch (e) {
-    console.error('remove failed:', e.response?.data || e.message);
-    res.status(500).json({ error: e.response?.data || e.message });
+    console.error('remove error:', e.message);
+    res.status(500).json({ error: 'Unable to remove item' });
   }
 });
 
@@ -157,15 +254,20 @@ function mapTx(t) {
     merchant_name:     t.merchant_name,
     pending:           t.pending,
     personal_finance_category: t.personal_finance_category ? {
-      primary:  t.personal_finance_category.primary,
-      detailed: t.personal_finance_category.detailed,
+      primary:          t.personal_finance_category.primary,
+      detailed:         t.personal_finance_category.detailed,
       confidence_level: t.personal_finance_category.confidence_level,
     } : null,
     logo_url: t.logo_url,
-    location: t.location ? { lat: t.location.lat, lon: t.location.lon } : null,
+    location: t.location?.lat != null ? { lat: t.location.lat, lon: t.location.lon } : null,
   };
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Budget Goat backend listening on http://0.0.0.0:${PORT} (${PLAID_ENV})`);
+  console.log(`Budget Goat backend started`);
+  console.log(`  NODE_ENV:           ${NODE_ENV}`);
+  console.log(`  PLAID_ENV:          ${PLAID_ENV}`);
+  console.log(`  PLAID_REDIRECT_URI: ${PLAID_REDIRECT_URI ?? '(not set)'}`);
+  console.log(`  PLAID_PRODUCTS:     ${PLAID_PRODUCTS.join(', ')}`);
+  console.log(`  Listening on:       :${PORT}`);
 });

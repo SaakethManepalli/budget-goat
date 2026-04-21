@@ -58,10 +58,8 @@
 	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
+		<key>NSAllowsArbitraryLoads</key>
+		<false/>
 	</dict>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Budget Goat connects to a local development backend during testing.</string>
 </dict>
 </plist>

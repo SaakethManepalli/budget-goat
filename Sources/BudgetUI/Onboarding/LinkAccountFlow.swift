@@ -131,6 +131,8 @@ public struct LinkAccountFlow: View {
                 institutionId: success.institutionId
             )
             state = .success(summary)
+        } catch BudgetError.linkCancelled {
+            state = .idle       // user chose to cancel — not an error
         } catch let err as BudgetError {
             state = .failed(err.errorDescription ?? "Link failed")
         } catch {

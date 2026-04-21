@@ -120,6 +120,9 @@ public final class SecureEnclaveKeyStore: DeviceSigning, @unchecked Sendable {
         guard status == errSecSuccess, let keyRef = item else {
             throw BudgetError.keychainFailure(status)
         }
+        guard CFGetTypeID(keyRef) == SecKeyGetTypeID() else {
+            throw BudgetError.keychainFailure(errSecInvalidKeyRef)
+        }
         return keyRef as! SecKey
     }
 

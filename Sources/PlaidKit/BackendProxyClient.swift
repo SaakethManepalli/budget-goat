@@ -1,6 +1,14 @@
 import Foundation
+import CryptoKit
 import BudgetCore
 import SecureStorage
+
+private extension Data {
+    var sha256HexString: String {
+        let digest = SHA256.hash(data: self)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
 
 public protocol BackendProxyClient: Sendable {
     func createLinkToken() async throws -> String
@@ -12,32 +20,40 @@ public protocol BackendProxyClient: Sendable {
 public struct BackendProxyConfiguration: Sendable {
     public let baseURL: URL
     public let sessionTokenProvider: @Sendable () async throws -> String
+    public let sessionTokenInvalidator: @Sendable () async -> Void
     public let deviceSigner: DeviceSigning?
     public let pinnedCertificateSHA256: [String]
 
     public init(
         baseURL: URL,
         sessionTokenProvider: @Sendable @escaping () async throws -> String,
+        sessionTokenInvalidator: @Sendable @escaping () async -> Void = {},
         deviceSigner: DeviceSigning? = nil,
         pinnedCertificateSHA256: [String] = []
     ) {
         self.baseURL = baseURL
         self.sessionTokenProvider = sessionTokenProvider
+        self.sessionTokenInvalidator = sessionTokenInvalidator
         self.deviceSigner = deviceSigner
         self.pinnedCertificateSHA256 = pinnedCertificateSHA256
     }
 }
 
-public final class URLSessionBackendProxyClient: BackendProxyClient, @unchecked Sendable {
+public final class URLSessionBackendProxyClient: NSObject, BackendProxyClient, URLSessionDelegate, @unchecked Sendable {
 
     private let configuration: BackendProxyConfiguration
-    private let session: URLSession
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest  = 60
+        config.timeoutIntervalForResource = 120
+        config.waitsForConnectivity = true
+        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }()
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    public init(configuration: BackendProxyConfiguration, session: URLSession = .shared) {
+    public init(configuration: BackendProxyConfiguration) {
         self.configuration = configuration
-        self.session = session
         self.encoder = {
             let e = JSONEncoder()
             e.keyEncodingStrategy = .convertToSnakeCase
@@ -50,6 +66,36 @@ public final class URLSessionBackendProxyClient: BackendProxyClient, @unchecked 
             d.dateDecodingStrategy = .iso8601
             return d
         }()
+    }
+
+    // MARK: - Certificate Pinning
+
+    public func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard configuration.pinnedCertificateSHA256.isEmpty == false,
+              challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let serverTrust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+
+        guard let chain = SecTrustCopyCertificateChain(serverTrust) as? [SecCertificate],
+              let leaf = chain.first else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+
+        let certData = SecCertificateCopyData(leaf) as Data
+        let sha256 = certData.sha256HexString
+
+        if configuration.pinnedCertificateSHA256.contains(sha256) {
+            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+        } else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+        }
     }
 
     public func createLinkToken() async throws -> String {
@@ -99,6 +145,20 @@ public final class URLSessionBackendProxyClient: BackendProxyClient, @unchecked 
     private struct EmptyBody: Encodable {}
 
     private func perform<Body: Encodable, Response: Decodable>(
+        path: String,
+        method: String,
+        body: Body
+    ) async throws -> Response {
+        do {
+            return try await performOnce(path: path, method: method, body: body)
+        } catch BudgetError.unauthorized {
+            // Cached session token was rejected — clear it and re-auth, retry once.
+            await configuration.sessionTokenInvalidator()
+            return try await performOnce(path: path, method: method, body: body)
+        }
+    }
+
+    private func performOnce<Body: Encodable, Response: Decodable>(
         path: String,
         method: String,
         body: Body

@@ -57,7 +57,7 @@ To link your bank account, we use Plaid, a regulated financial data aggregator. 
 
 You can revoke Plaid's access at any time either from inside Budget Goat (Settings → Unlink Bank) or from [my.plaid.com](https://my.plaid.com).
 
-## 5. Third-Party Services
+x## 5. Third-Party Services
 
 The only third parties that receive any information about you are:
 

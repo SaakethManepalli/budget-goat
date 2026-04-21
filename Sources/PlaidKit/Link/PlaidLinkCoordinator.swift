@@ -3,7 +3,10 @@ import BudgetCore
 
 #if canImport(UIKit)
 import UIKit
-import SafariServices
+#endif
+
+#if canImport(LinkKit)
+import LinkKit
 #endif
 
 public struct PlaidLinkSuccess: Sendable {
@@ -18,15 +21,25 @@ public struct PlaidLinkSuccess: Sendable {
     }
 }
 
+// MARK: - iOS
+
 #if canImport(UIKit)
 
 public protocol PlaidLinkPresenting: Sendable {
     @MainActor
     func presentLink(on host: UIViewController, linkToken: String) async throws -> PlaidLinkSuccess
+    @MainActor
+    func resumeAfterRedirect(_ url: URL) -> Bool
 }
 
 @MainActor
 public final class PlaidLinkCoordinator: NSObject, PlaidLinkPresenting {
+
+    // Retains the LinkKit Handler for the duration of the Link session.
+    // Without this, the handler is deallocated immediately and Link never opens.
+    #if canImport(LinkKit)
+    private var retainedHandler: (any Handler)?
+    #endif
 
     public override init() { super.init() }
 
@@ -34,53 +47,82 @@ public final class PlaidLinkCoordinator: NSObject, PlaidLinkPresenting {
         #if canImport(LinkKit)
         return try await presentNative(on: host, linkToken: linkToken)
         #else
-        return try await presentWebFallback(on: host, linkToken: linkToken)
+        throw BudgetError.linkFailed(
+            "LinkKit SDK not installed. Run xcodegen generate after adding it to project.yml."
+        )
         #endif
     }
 
-    private func presentWebFallback(on host: UIViewController, linkToken: String) async throws -> PlaidLinkSuccess {
-        guard let url = URL(string: "https://cdn.plaid.com/link/v2/stable/link.html?isWebview=true&token=\(linkToken)") else {
-            throw BudgetError.linkFailed("invalid link URL")
-        }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            let sfvc = SFSafariViewController(url: url)
-            sfvc.modalPresentationStyle = .formSheet
-            sfvc.delegate = LinkSafariDelegate.shared
-            LinkSafariDelegate.shared.continuation = continuation
-            host.present(sfvc, animated: true)
-        }
+    /// Resumes an in-flight Plaid Link OAuth flow after the bank redirects
+    /// back to the app. Call this from `onOpenURL` in the scene/app.
+    /// Returns `true` if the URL was handled by Plaid.
+    @discardableResult
+    public func resumeAfterRedirect(_ url: URL) -> Bool {
+        #if canImport(LinkKit)
+        guard let handler = retainedHandler else { return false }
+        handler.resumeAfterTermination(from: url)
+        return true
+        #else
+        return false
+        #endif
     }
-
+ 
     #if canImport(LinkKit)
     private func presentNative(on host: UIViewController, linkToken: String) async throws -> PlaidLinkSuccess {
-        throw BudgetError.linkFailed("LinkKit native path stub — wire up when SDK is added as dependency")
+        return try await withCheckedThrowingContinuation { continuation in
+
+            var config = LinkTokenConfiguration(
+                token: linkToken,
+                onSuccess: { [weak self] success in
+                    self?.retainedHandler = nil
+                    continuation.resume(returning: PlaidLinkSuccess(
+                        publicToken: success.publicToken,
+                        institutionId: success.metadata.institution.id,
+                        institutionName: success.metadata.institution.name
+                    ))
+                }
+            )
+
+            // Called when: user taps Cancel, swipes to dismiss, or an error occurs.
+            config.onExit = { [weak self] exit in
+                self?.retainedHandler = nil
+                if let error = exit.error {
+                    // Plaid returned an error (e.g. invalid credentials, institution unavailable)
+                    let message = error.displayMessage ?? error.errorCode.description
+                    continuation.resume(throwing: BudgetError.linkFailed(message))
+                } else {
+                    // User deliberately cancelled — not an error condition
+                    continuation.resume(throwing: BudgetError.linkCancelled)
+                }
+            }
+
+            switch Plaid.create(config) {
+            case .failure(let error):
+                continuation.resume(throwing: BudgetError.linkFailed(error.localizedDescription))
+            case .success(let handler):
+                retainedHandler = handler
+                handler.open(presentUsing: .viewController(host))
+            }
+        }
     }
     #endif
 }
 
-private final class LinkSafariDelegate: NSObject, SFSafariViewControllerDelegate, @unchecked Sendable {
-    static let shared = LinkSafariDelegate()
-    var continuation: CheckedContinuation<PlaidLinkSuccess, Error>?
-
-    func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
-        continuation?.resume(throwing: BudgetError.linkCancelled)
-        continuation = nil
-    }
-}
+// MARK: - macOS stub
 
 #else
 
 public protocol PlaidLinkPresenting: Sendable {
     func presentLink(linkToken: String) async throws -> PlaidLinkSuccess
+    func resumeAfterRedirect(_ url: URL) -> Bool
 }
 
 public final class PlaidLinkCoordinator: PlaidLinkPresenting, @unchecked Sendable {
     public init() {}
-
     public func presentLink(linkToken: String) async throws -> PlaidLinkSuccess {
         throw BudgetError.linkFailed("Plaid Link requires iOS UIKit runtime")
     }
+    public func resumeAfterRedirect(_ url: URL) -> Bool { false }
 }
 
 #endif

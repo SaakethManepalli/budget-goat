@@ -7,6 +7,11 @@ options:
   xcodeVersion: "15.3"
   groupSortPosition: top
 
+configs:
+  Debug: debug
+  Staging: release
+  Release: release
+
 settings:
   base:
     SWIFT_VERSION: "5.10"
@@ -18,6 +23,9 @@ settings:
 packages:
   BudgetGoatPackage:
     path: .
+  PlaidLinkiOS:
+    url: https://github.com/plaid/plaid-link-ios
+    from: "5.6.0"
 
 targets:
   BudgetGoat:
@@ -29,17 +37,65 @@ targets:
       - path: App/BudgetGoat/Assets.xcassets
     info:
       path: App/BudgetGoat/Info.plist
+      properties:
+        CFBundleDisplayName: Budget Goat
+        LSRequiresIPhoneOS: true
+        NSFaceIDUsageDescription: "Budget Goat uses Face ID to unlock the app and protect your bank account details. Your financial data never leaves your device without authentication."
+        UILaunchScreen:
+          UIColorName: AccentColor
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        "UISupportedInterfaceOrientations~ipad":
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIBackgroundModes:
+          - fetch
+          - remote-notification
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.budgetgoat.sync.refresh
+        ITSAppUsesNonExemptEncryption: false
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: false
+        # Register custom URL scheme for sandbox OAuth testing.
+        # For production, set redirect_uri to a Universal Link instead.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.ainstein.budgetgoat.plaid-oauth
+            CFBundleURLSchemes:
+              - budgetgoat
+        # Preprocessor-style environment flag surfaced as BUDGETGOAT_PLAID_ENV
+        # (value per build configuration — see per-config settings below).
     entitlements:
       path: App/BudgetGoat/BudgetGoat.entitlements
+      properties:
+        com.apple.developer.default-data-protection: NSFileProtectionComplete
+        com.apple.developer.associated-domains:
+          - applinks:ainstein.cloud
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.budgetgoat.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.ainstein.budgetgoat
         INFOPLIST_FILE: App/BudgetGoat/Info.plist
         CODE_SIGN_ENTITLEMENTS: App/BudgetGoat/BudgetGoat.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO
         DEVELOPMENT_TEAM: ""
         CODE_SIGN_STYLE: Automatic
+      configs:
+        Debug:
+          # Hits a locally-running backend configured with PLAID_ENV=sandbox
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG BUDGETGOAT_SANDBOX
+          BUDGETGOAT_BACKEND_URL: "http://localhost:8787"
+        Staging:
+          # Fly.io deployment still pointed at Plaid sandbox
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: BUDGETGOAT_SANDBOX
+          BUDGETGOAT_BACKEND_URL: "https://budget-goat-api.fly.dev"
+        Release:
+          # Production — backend must have PLAID_ENV=production
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: ""
+          BUDGETGOAT_BACKEND_URL: "https://budget-goat-api.fly.dev"
     dependencies:
       - package: BudgetGoatPackage
         product: BudgetCore
@@ -53,3 +109,5 @@ targets:
         product: TransactionEngine
       - package: BudgetGoatPackage
         product: BudgetUI
+      - package: PlaidLinkiOS
+        product: LinkKit
