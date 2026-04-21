@@ -10,9 +10,16 @@ public struct LinkAccountFlow: View {
     @EnvironmentObject private var dependencies: AppDependencies
     @Environment(\.dismiss) private var dismiss
 
+    /// When set, launch Plaid Link in update mode scoped to this item (reauth flow).
+    public let updateItemId: String?
+
     @State private var state: LinkState = .idle
     @State private var linkToken: String?
     @State private var error: String?
+
+    public init(updateItemId: String? = nil) {
+        self.updateItemId = updateItemId
+    }
 
     enum LinkState: Equatable {
         case idle
@@ -26,8 +33,6 @@ public struct LinkAccountFlow: View {
             String(describing: lhs) == String(describing: rhs)
         }
     }
-
-    public init() {}
 
     public var body: some View {
         NavigationStack {
@@ -121,18 +126,33 @@ public struct LinkAccountFlow: View {
     private func begin() async {
         state = .fetchingToken
         do {
-            let token = try await dependencies.linkUseCase.createLinkToken()
+            let token: String
+            if let itemId = updateItemId {
+                // Reauth / update mode — Plaid Link scoped to existing item
+                token = try await dependencies.syncProvider.createUpdateLinkToken(forItemId: itemId)
+            } else {
+                token = try await dependencies.linkUseCase.createLinkToken()
+            }
             self.linkToken = token
             state = .presenting
             let success = try await presentLink(token: token)
-            state = .exchanging
-            let summary = try await dependencies.linkUseCase.completeLink(
-                publicToken: success.publicToken,
-                institutionId: success.institutionId
-            )
-            state = .success(summary)
+
+            if updateItemId != nil {
+                // Update mode: no token exchange — the existing access_token
+                // is already valid on the backend. Clear the reauth flag and
+                // trigger a fresh sync on the caller.
+                dependencies.reauthCoordinator.clear()
+                state = .success(SyncSummary(added: 0, modified: 0, removed: 0, durationSeconds: 0))
+            } else {
+                state = .exchanging
+                let summary = try await dependencies.linkUseCase.completeLink(
+                    publicToken: success.publicToken,
+                    institutionId: success.institutionId
+                )
+                state = .success(summary)
+            }
         } catch BudgetError.linkCancelled {
-            state = .idle       // user chose to cancel — not an error
+            state = .idle
         } catch let err as BudgetError {
             state = .failed(err.errorDescription ?? "Link failed")
         } catch {

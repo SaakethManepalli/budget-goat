@@ -7,11 +7,17 @@ import PlaidKit
 import SecureStorage
 
 private let deviceIdentity = DeviceIdentityStore()
+private let sessionTokens = SessionTokenStore()
 
 @main
 struct BudgetGoatApp: App {
     @State private var dependencies: AppDependencies?
     @State private var bootstrapError: String?
+    @Environment(\.scenePhase) private var scenePhase
+
+    init() {
+        MetricsCollector.shared.start()
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -21,8 +27,6 @@ struct BudgetGoatApp: App {
                         .environmentObject(dependencies)
                         .modelContainer(dependencies.modelContainer)
                         .onOpenURL { url in
-                            // Plaid OAuth redirect re-entry: hand the URL to the
-                            // running Link handler so it can resume the flow.
                             _ = dependencies.linkPresenter.resumeAfterRedirect(url)
                         }
                 } else if let error = bootstrapError {
@@ -32,28 +36,28 @@ struct BudgetGoatApp: App {
                         .task { await bootstrap() }
                 }
             }
+            // R1: privacy overlay — blurs the window the moment the scene
+            // leaves .active, which is BEFORE iOS captures the app switcher
+            // snapshot. Without this, bank balances appear in the task grid.
+            .privacyOverlay(when: scenePhase)
         }
     }
 
-    private static let tokenKey  = "budgetgoat.session.token"
-    private static let expiryKey = "budgetgoat.session.expiry"
+    // MARK: - Session token (Keychain, not UserDefaults)
 
     private static func sessionToken(backendURL: URL) async throws -> String {
-        // Return cached token if still valid (>1 hour remaining)
-        if let cached = UserDefaults.standard.string(forKey: tokenKey),
-           !cached.isEmpty,
-           let expiry = UserDefaults.standard.object(forKey: expiryKey) as? Date,
-           expiry.timeIntervalSinceNow > 3600 {
-            return cached
+        // R2: JWT lives in Keychain under
+        // kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly. Survives restart,
+        // bound to device, excluded from iCloud backup, unreadable while locked.
+        if let entry = try? await sessionTokens.load(), entry.isFresh {
+            return entry.token
         }
         return try await fetchFreshSessionToken(backendURL: backendURL)
     }
 
     private static func fetchFreshSessionToken(backendURL: URL) async throws -> String {
-        // Fetch or create the device UUID (stored in Keychain, survives reinstall on same device)
         let deviceID = try await deviceIdentity.deviceID()
 
-        // Exchange for a 30-day JWT
         var request = URLRequest(url: backendURL.appendingPathComponent("/auth/device"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -67,15 +71,19 @@ struct BudgetGoatApp: App {
             throw BudgetError.invalidResponse("device auth failed")
         }
 
-        UserDefaults.standard.set(token, forKey: tokenKey)
-        UserDefaults.standard.set(Date().addingTimeInterval(expiresIn), forKey: expiryKey)
+        let entry = SessionTokenStore.Entry(
+            token: token,
+            expiresAt: Date().addingTimeInterval(expiresIn)
+        )
+        try? await sessionTokens.save(entry)
         return token
     }
 
-    private static func invalidateCachedSessionToken() {
-        UserDefaults.standard.removeObject(forKey: tokenKey)
-        UserDefaults.standard.removeObject(forKey: expiryKey)
+    private static func invalidateCachedSessionToken() async {
+        await sessionTokens.clear()
     }
+
+    // MARK: - Bootstrap
 
     private func bootstrap() async {
         let backendURLString = ProcessInfo.processInfo.environment["BUDGETGOAT_BACKEND_URL"]
@@ -91,9 +99,9 @@ struct BudgetGoatApp: App {
                 try await Self.sessionToken(backendURL: backendURL)
             },
             sessionTokenInvalidator: {
-                Self.invalidateCachedSessionToken()
+                await Self.invalidateCachedSessionToken()
             },
-            pinnedCertificateSHA256: []   // Fly.io Anycast serves different leaf certs per edge node; standard TLS validation is enforced instead
+            pinnedCertificateSHA256: []   // CA pinning: follow-up (Y2)
         )
 
         let configuration = AppDependencies.Configuration(

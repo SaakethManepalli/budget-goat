@@ -83,6 +83,9 @@ public protocol CursorStore: Sendable {
 
 public protocol BankSyncProvider: Sendable {
     func createLinkToken() async throws -> String
+    /// Update-mode link token: scoped to an existing item for re-authentication.
+    /// Issued by the backend using the stored access_token for that item.
+    func createUpdateLinkToken(forItemId: String) async throws -> String
     func exchangePublicToken(_ publicToken: String, institutionId: String) async throws -> LinkedItem
     func syncTransactions(itemId: String, cursor: String?, count: Int) async throws -> SyncDelta
     func removeItem(itemId: String) async throws

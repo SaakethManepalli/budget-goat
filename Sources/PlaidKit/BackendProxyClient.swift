@@ -12,6 +12,7 @@ private extension Data {
 
 public protocol BackendProxyClient: Sendable {
     func createLinkToken() async throws -> String
+    func createUpdateLinkToken(forItemId: String) async throws -> String
     func exchangePublicToken(_ publicToken: String, institutionId: String) async throws -> LinkedItem
     func syncTransactions(itemId: String, cursor: String?, count: Int) async throws -> SyncDelta
     func removeItem(itemId: String) async throws
@@ -107,6 +108,16 @@ public final class URLSessionBackendProxyClient: NSObject, BackendProxyClient, U
         return response.linkToken
     }
 
+    public func createUpdateLinkToken(forItemId itemId: String) async throws -> String {
+        struct UpdateRequest: Encodable { let itemId: String }
+        let response: LinkTokenResponse = try await perform(
+            path: "/api/link/token/update",
+            method: "POST",
+            body: UpdateRequest(itemId: itemId)
+        )
+        return response.linkToken
+    }
+
     public func exchangePublicToken(_ publicToken: String, institutionId: String) async throws -> LinkedItem {
         let body = ExchangeRequest(publicToken: publicToken, institutionId: institutionId)
         let response: ExchangeResponse = try await perform(
@@ -149,12 +160,41 @@ public final class URLSessionBackendProxyClient: NSObject, BackendProxyClient, U
         method: String,
         body: Body
     ) async throws -> Response {
-        do {
-            return try await performOnce(path: path, method: method, body: body)
-        } catch BudgetError.unauthorized {
-            // Cached session token was rejected — clear it and re-auth, retry once.
-            await configuration.sessionTokenInvalidator()
-            return try await performOnce(path: path, method: method, body: body)
+        var attempt = 0
+        let maxAttempts = 3
+        var lastError: Error = BudgetError.networkUnavailable
+
+        while attempt < maxAttempts {
+            do {
+                return try await performOnce(path: path, method: method, body: body)
+            } catch BudgetError.unauthorized where attempt == 0 {
+                // Cached session token was rejected — clear it and re-auth.
+                // Only retry auth once; never loop.
+                await configuration.sessionTokenInvalidator()
+                attempt += 1
+                continue
+            } catch let err as BudgetError {
+                // Retry transient failures (networkUnavailable, 5xx bubbled as syncFailed)
+                // with exponential backoff. Don't retry user-cancelled, reauth, unauthorized.
+                if shouldRetry(err) && attempt < maxAttempts - 1 {
+                    let delayNs = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000
+                    try? await Task.sleep(nanoseconds: delayNs)
+                    lastError = err
+                    attempt += 1
+                    continue
+                }
+                throw err
+            }
+        }
+        throw lastError
+    }
+
+    private func shouldRetry(_ error: BudgetError) -> Bool {
+        switch error {
+        case .networkUnavailable, .syncFailed:
+            return true
+        default:
+            return false
         }
     }
 

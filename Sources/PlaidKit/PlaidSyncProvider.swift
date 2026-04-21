@@ -16,6 +16,10 @@ public final class PlaidSyncProvider: BankSyncProvider, @unchecked Sendable {
         try await proxy.createLinkToken()
     }
 
+    public func createUpdateLinkToken(forItemId itemId: String) async throws -> String {
+        try await proxy.createUpdateLinkToken(forItemId: itemId)
+    }
+
     public func exchangePublicToken(_ publicToken: String, institutionId: String) async throws -> LinkedItem {
         let item = try await proxy.exchangePublicToken(publicToken, institutionId: institutionId)
         try await tokenStore.store(itemId: item.itemId, forKey: item.itemId)

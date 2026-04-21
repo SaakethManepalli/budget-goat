@@ -26,6 +26,7 @@ public final class AppDependencies: ObservableObject {
     public let resetUseCase: ResetDataUseCase
     public let webhookBus: WebhookEventBus
     public let recurringDetector: RecurringDetector
+    public let reauthCoordinator: ReauthCoordinator
 
     public init(configuration: Configuration) throws {
         self.modelContainer = try configuration.containerFactory()
@@ -84,6 +85,7 @@ public final class AppDependencies: ObservableObject {
 
         self.webhookBus = WebhookEventBus()
         self.recurringDetector = RecurringDetector()
+        self.reauthCoordinator = ReauthCoordinator()
     }
 
     public struct Configuration {

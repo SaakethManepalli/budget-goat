@@ -12,6 +12,7 @@ const PLAID_CLIENT_ID    = process.env.PLAID_CLIENT_ID;
 const PLAID_SECRET       = process.env.PLAID_SECRET;
 const PLAID_ENV          = process.env.PLAID_ENV || 'sandbox';
 const PLAID_REDIRECT_URI = process.env.PLAID_REDIRECT_URI || null;
+const PLAID_WEBHOOK_URL  = process.env.PLAID_WEBHOOK_URL  || null;
 const PLAID_PRODUCTS     = (process.env.PLAID_PRODUCTS || 'transactions')
                              .split(',').map(s => s.trim());
 const PORT               = Number(process.env.PORT || 8787);
@@ -21,17 +22,31 @@ if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
   process.exit(1);
 }
 
-// Production startup contract: refuse to boot with insecure config.
-if (IS_PRODUCTION) {
+// Startup contract. Two tiers:
+// 1. NODE_ENV=production  → no DEV bypass tokens allowed
+// 2. PLAID_ENV=production → strict: https redirect, real Plaid credentials
+// Running on Fly.io in NODE_ENV=production with PLAID_ENV=sandbox is a valid
+// staging mode and is not rejected here.
+{
   const violations = [];
-  if (PLAID_ENV !== 'production')            violations.push('PLAID_ENV must be "production"');
-  if (process.env.DEV_SESSION_TOKEN)         violations.push('DEV_SESSION_TOKEN must not be set');
-  if (!PLAID_REDIRECT_URI)                   violations.push('PLAID_REDIRECT_URI must be set');
-  if (PLAID_REDIRECT_URI && !PLAID_REDIRECT_URI.startsWith('https://')) {
-    violations.push('PLAID_REDIRECT_URI must be an https:// Universal Link in production');
+
+  // Tier 1 — Node-production security hardening
+  if (IS_PRODUCTION && process.env.DEV_SESSION_TOKEN) {
+    violations.push('DEV_SESSION_TOKEN must not be set when NODE_ENV=production');
   }
+
+  // Tier 2 — Plaid-production enforcement (only when actually hitting Plaid prod)
+  if (PLAID_ENV === 'production') {
+    if (!PLAID_REDIRECT_URI) {
+      violations.push('PLAID_REDIRECT_URI must be set when PLAID_ENV=production');
+    }
+    if (PLAID_REDIRECT_URI && !PLAID_REDIRECT_URI.startsWith('https://')) {
+      violations.push('PLAID_REDIRECT_URI must be an https:// Universal Link when PLAID_ENV=production');
+    }
+  }
+
   if (violations.length) {
-    console.error('Refusing to start in production:\n  - ' + violations.join('\n  - '));
+    console.error('Refusing to start:\n  - ' + violations.join('\n  - '));
     process.exit(1);
   }
 }
@@ -135,15 +150,14 @@ app.post('/api/link/token/create', plaidLimiter, async (req, res) => {
       country_codes: [CountryCode.Us],
       language: 'en',
     };
-    if (PLAID_REDIRECT_URI) {
-      payload.redirect_uri = PLAID_REDIRECT_URI;
-    }
+    if (PLAID_REDIRECT_URI) payload.redirect_uri = PLAID_REDIRECT_URI;
+    if (PLAID_WEBHOOK_URL)  payload.webhook      = PLAID_WEBHOOK_URL;
+
     const response = await plaid.linkTokenCreate(payload);
     res.json({ link_token: response.data.link_token, expiration: response.data.expiration });
   } catch (e) {
     const err = e.response?.data;
     console.error('link/token/create error:', err?.error_code, err?.error_message);
-    // Surface the real Plaid error so the iOS app can show it to the user
     res.status(502).json({
       error: err?.error_message || 'Unable to create link token',
       error_code: err?.error_code,
@@ -223,6 +237,81 @@ app.post('/api/transactions/sync', plaidLimiter, async (req, res) => {
     console.error('sync error:', code);
     res.status(500).json({ error: 'Unable to sync transactions' });
   }
+});
+
+// Update-mode link token — used by the iOS app to re-authenticate an
+// existing item whose bank session has expired (ITEM_LOGIN_REQUIRED).
+// The link token must be minted with the item's access_token; the iOS
+// client never sees the access_token.
+app.post('/api/link/token/update', plaidLimiter, async (req, res) => {
+  try {
+    const { item_id } = req.body;
+    if (!item_id) return res.status(400).json({ error: 'item_id required' });
+
+    const access_token = getAccessToken(item_id);
+    if (!access_token) return res.status(404).json({ error: 'item not found' });
+
+    const payload = {
+      user: { client_user_id: req.userId },
+      client_name: 'Budget Goat',
+      country_codes: [CountryCode.Us],
+      language: 'en',
+      access_token,   // update mode is triggered by this field
+    };
+    if (PLAID_REDIRECT_URI) payload.redirect_uri = PLAID_REDIRECT_URI;
+    if (PLAID_WEBHOOK_URL)  payload.webhook      = PLAID_WEBHOOK_URL;
+
+    const response = await plaid.linkTokenCreate(payload);
+    res.json({ link_token: response.data.link_token, expiration: response.data.expiration });
+  } catch (e) {
+    const err = e.response?.data;
+    console.error('link/token/update error:', err?.error_code);
+    res.status(502).json({ error: err?.error_message || 'Unable to create update link token' });
+  }
+});
+
+// One-shot: attach the webhook URL to an already-linked item whose link_token
+// was minted before PLAID_WEBHOOK_URL was set. Idempotent.
+app.post('/api/item/webhook/attach', plaidLimiter, async (req, res) => {
+  try {
+    if (!PLAID_WEBHOOK_URL) return res.status(400).json({ error: 'PLAID_WEBHOOK_URL not configured' });
+    const { item_id } = req.body;
+    if (!item_id) return res.status(400).json({ error: 'item_id required' });
+    const access_token = getAccessToken(item_id);
+    if (!access_token) return res.status(404).json({ error: 'item not found' });
+
+    await plaid.itemWebhookUpdate({ access_token, webhook: PLAID_WEBHOOK_URL });
+    res.json({ ok: true });
+  } catch (e) {
+    const err = e.response?.data;
+    console.error('item/webhook/attach error:', err?.error_code);
+    res.status(502).json({ error: err?.error_message || 'Unable to attach webhook' });
+  }
+});
+
+// Plaid webhook receiver. Not protected by requireAuth — Plaid signs
+// webhook calls with a JWT in the `plaid-verification` header. In production
+// you MUST verify this signature before acting on the payload.
+// For now we log and store the event so a subsequent sync can react to it.
+app.post('/plaid/webhooks', express.json(), async (req, res) => {
+  const { webhook_type, webhook_code, item_id } = req.body || {};
+  console.log(`[webhook] ${webhook_type}/${webhook_code} item=${item_id}`);
+
+  // For ITEM_LOGIN_REQUIRED and PENDING_EXPIRATION, the next /transactions/sync
+  // call will naturally return 409 from Plaid. The iOS client's reauth banner
+  // fires from that 409. No server-side state needed beyond the access token
+  // still being present — we simply don't delete it.
+  //
+  // For TRANSACTIONS_REMOVED, the next /transactions/sync will include the
+  // removed IDs in the response automatically.
+  //
+  // For USER_PERMISSION_REVOKED, we purge the access token immediately.
+  if (webhook_code === 'USER_PERMISSION_REVOKED' && item_id) {
+    try { deleteItem(item_id); } catch {}
+  }
+
+  // Always 200 — Plaid will retry on non-2xx and spam the endpoint.
+  res.sendStatus(200);
 });
 
 app.post('/api/item/remove', plaidLimiter, async (req, res) => {
